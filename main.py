@@ -5,6 +5,7 @@ import glob
 import logging
 import tempfile
 import threading
+
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -50,7 +51,7 @@ WELCOME_MESSAGE = (
     "📱 TikTok\n"
     "📸 Instagram\n\n"
     "طريقة الاستخدام:\n"
-    "1. انسخ رابط الفيديو العام.\n"
+    "1. انسخ رابط الفيديو.\n"
     "2. أرسله هنا.\n"
     "3. انتظر وصول الفيديو إليك.\n\n"
     "للمساعدة أرسل /help\n"
@@ -78,6 +79,7 @@ HELP_MESSAGE = (
 # =========================
 
 def telegram_request(method, data=None, files=None, timeout=60):
+
     response = requests.post(
         f"{API_URL}/{method}",
         data=data,
@@ -93,13 +95,19 @@ def telegram_request(method, data=None, files=None, timeout=60):
         )
 
     if not response.ok or not result.get("ok"):
-        description = result.get("description", "Unknown Telegram error")
-        raise RuntimeError(f"Telegram {method}: {description}")
+        description = result.get(
+            "description",
+            "Unknown Telegram error"
+        )
+        raise RuntimeError(
+            f"Telegram {method}: {description}"
+        )
 
     return result
 
 
 def send_message(chat_id, text):
+
     try:
         telegram_request(
             "sendMessage",
@@ -108,11 +116,13 @@ def send_message(chat_id, text):
                 "text": text
             }
         )
+
     except Exception as error:
         logger.error("SEND MESSAGE ERROR: %s", error)
 
 
 def send_action(chat_id):
+
     try:
         telegram_request(
             "sendChatAction",
@@ -121,6 +131,7 @@ def send_action(chat_id):
                 "action": "upload_video"
             }
         )
+
     except Exception:
         pass
 
@@ -143,6 +154,7 @@ YOUTUBE_DOMAINS = (
 
 
 def get_url(text):
+
     match = re.search(r"https?://\S+", text or "")
 
     if not match:
@@ -152,6 +164,7 @@ def get_url(text):
 
 
 def get_domain(url):
+
     try:
         parsed = urlparse(url)
 
@@ -165,6 +178,7 @@ def get_domain(url):
 
 
 def domain_matches(host, domains):
+
     return any(
         host == domain or host.endswith("." + domain)
         for domain in domains
@@ -172,6 +186,7 @@ def domain_matches(host, domains):
 
 
 def is_youtube_url(url):
+
     host = get_domain(url)
 
     return bool(
@@ -180,6 +195,7 @@ def is_youtube_url(url):
 
 
 def extract_url(text):
+
     url = get_url(text)
 
     if not url:
@@ -201,36 +217,60 @@ def extract_url(text):
 # =========================
 
 def download_video(url, folder):
+
     options = {
-        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        "outtmpl": os.path.join(
+            folder,
+            "%(id)s.%(ext)s"
+        ),
+
         "format": "best[ext=mp4]/best",
+
+        # تحسين الاتصال بتيك توك
+        "impersonate": "chrome",
+
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+
         "max_filesize": MAX_FILE_SIZE,
+
         "socket_timeout": 30,
-        "retries": 2,
-        "fragment_retries": 2,
+        "retries": 3,
+        "fragment_retries": 3,
+
         "restrictfilenames": True,
         "overwrites": True,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
+
+        info = ydl.extract_info(
+            url,
+            download=True
+        )
 
         if not info:
-            raise RuntimeError("No video information returned")
+            raise RuntimeError(
+                "No video information returned"
+            )
 
-        files = glob.glob(os.path.join(folder, "*"))
+        files = glob.glob(
+            os.path.join(folder, "*")
+        )
 
         video_files = [
             path for path in files
             if os.path.isfile(path)
-            and not path.endswith((".part", ".ytdl"))
+            and not path.endswith(
+                (".part", ".ytdl")
+            )
         ]
 
         if not video_files:
-            raise RuntimeError("Downloaded file was not found")
+            raise RuntimeError(
+                "Downloaded file was not found"
+            )
 
         video_files.sort(
             key=lambda path: os.path.getsize(path),
@@ -238,13 +278,18 @@ def download_video(url, folder):
         )
 
         video_path = video_files[0]
+
         size = os.path.getsize(video_path)
 
         if size <= 0:
-            raise RuntimeError("Downloaded file is empty")
+            raise RuntimeError(
+                "Downloaded file is empty"
+            )
 
         if size > MAX_FILE_SIZE:
-            raise RuntimeError("Video exceeds Telegram upload limit")
+            raise RuntimeError(
+                "Video exceeds Telegram upload limit"
+            )
 
         return video_path
 
@@ -254,7 +299,10 @@ def download_video(url, folder):
 # =========================
 
 def upload_video(chat_id, video_path):
-    extension = os.path.splitext(video_path)[1].lower()
+
+    extension = os.path.splitext(
+        video_path
+    )[1].lower()
 
     if extension == ".mp4":
         method = "sendVideo"
@@ -264,25 +312,31 @@ def upload_video(chat_id, video_path):
         field = "document"
 
     with open(video_path, "rb") as video_file:
+
         try:
+
             telegram_request(
                 method,
+
                 data={
                     "chat_id": chat_id,
                     "supports_streaming": "true"
                 } if method == "sendVideo" else {
                     "chat_id": chat_id
                 },
+
                 files={
                     field: (
                         os.path.basename(video_path),
                         video_file
                     )
                 },
+
                 timeout=180
             )
 
         except Exception:
+
             if method != "sendVideo":
                 raise
 
@@ -290,13 +344,18 @@ def upload_video(chat_id, video_path):
 
             telegram_request(
                 "sendDocument",
-                data={"chat_id": chat_id},
+
+                data={
+                    "chat_id": chat_id
+                },
+
                 files={
                     "document": (
                         os.path.basename(video_path),
                         video_file
                     )
                 },
+
                 timeout=180
             )
 
@@ -308,13 +367,16 @@ def upload_video(chat_id, video_path):
 def process_download(chat_id, url):
 
     if not download_lock.acquire(blocking=False):
+
         send_message(
             chat_id,
             "⏳ يوجد طلب تنزيل آخر قيد التنفيذ. حاول بعد قليل."
         )
+
         return
 
     try:
+
         send_message(
             chat_id,
             "⏳ جاري تجهيز الفيديو وتنزيله..."
@@ -324,9 +386,14 @@ def process_download(chat_id, url):
 
         with tempfile.TemporaryDirectory() as folder:
 
-            logger.info("Starting download request")
+            logger.info(
+                "Starting download request"
+            )
 
-            video_path = download_video(url, folder)
+            video_path = download_video(
+                url,
+                folder
+            )
 
             logger.info(
                 "Download completed. File size: %s bytes",
@@ -338,37 +405,66 @@ def process_download(chat_id, url):
                 "📤 اكتمل التنزيل، جاري إرسال الفيديو..."
             )
 
-            upload_video(chat_id, video_path)
+            upload_video(
+                chat_id,
+                video_path
+            )
 
-            logger.info("Video sent successfully")
+            logger.info(
+                "Video sent successfully"
+            )
 
     except Exception as error:
 
-        logger.exception("DOWNLOAD ERROR: %r", error)
+        logger.exception(
+            "DOWNLOAD ERROR: %r",
+            error
+        )
 
         error_text = str(error).lower()
 
-        if "max-filesize" in error_text or "file size" in error_text:
-            message = "❌ حجم الفيديو أكبر من الحد المسموح (49 MB)."
+        if (
+            "max-filesize" in error_text
+            or "file size" in error_text
+        ):
 
-        elif "private" in error_text or "login" in error_text:
-            message = "❌ الفيديو خاص أو يتطلب تسجيل دخول."
+            message = (
+                "❌ حجم الفيديو أكبر من الحد المسموح (49 MB)."
+            )
+
+        elif (
+            "private" in error_text
+            or "login" in error_text
+        ):
+
+            message = (
+                "❌ الفيديو خاص أو يتطلب تسجيل دخول."
+            )
 
         elif "unsupported url" in error_text:
+
             message = "❌ الرابط غير مدعوم."
 
         elif "telegram" in error_text:
-            message = "❌ تم تنزيل الفيديو لكن تعذر إرساله إلى تيليجرام."
 
-        else:
             message = (
-                "❌ تعذر تنزيل الفيديو.\n"
-                "تأكد من أن الرابط عام وحاول مرة أخرى."
+                "❌ تم تنزيل الفيديو لكن تعذر إرساله إلى تيليجرام."
             )
 
-        send_message(chat_id, message)
+        else:
+
+            message = (
+                "❌ تعذر تنزيل الفيديو.\n"
+                "تأكد من أن الرابط متاح للعامة وحاول مرة أخرى."
+            )
+
+        send_message(
+            chat_id,
+            message
+        )
 
     finally:
+
         download_lock.release()
 
 
@@ -378,6 +474,7 @@ def process_download(chat_id, url):
 
 @app.route("/", methods=["GET"])
 def home():
+
     return "MJD Video Downloader is running."
 
 
@@ -385,36 +482,58 @@ def home():
 def webhook():
 
     if WEBHOOK_SECRET:
+
         received_secret = request.headers.get(
-            "X-Telegram-Bot-Api-Secret-Token", ""
+            "X-Telegram-Bot-Api-Secret-Token",
+            ""
         )
 
         if received_secret != WEBHOOK_SECRET:
             return jsonify({"ok": False}), 403
 
     update = request.get_json(silent=True) or {}
+
     message = update.get("message")
 
     if not message:
         return jsonify({"ok": True})
 
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
+    chat_id = message.get(
+        "chat", {}
+    ).get("id")
+
+    text = message.get(
+        "text", ""
+    ).strip()
 
     if not chat_id:
         return jsonify({"ok": True})
 
-    if text.startswith("/start"):
-        send_message(chat_id, WELCOME_MESSAGE)
+    # أمر البداية
+    if text.split()[0].split("@")[0] == "/start" if text else False:
+
+        send_message(
+            chat_id,
+            WELCOME_MESSAGE
+        )
+
         return jsonify({"ok": True})
 
-    if text.startswith("/help"):
-        send_message(chat_id, HELP_MESSAGE)
+    # أمر المساعدة
+    if text.split()[0].split("@")[0] == "/help" if text else False:
+
+        send_message(
+            chat_id,
+            HELP_MESSAGE
+        )
+
         return jsonify({"ok": True})
 
     url = get_url(text)
 
+    # منع روابط يوتيوب
     if url and is_youtube_url(url):
+
         send_message(
             chat_id,
             "❌ عذراً، YouTube غير مدعوم حالياً.\n\n"
@@ -422,22 +541,29 @@ def webhook():
             "📱 TikTok\n"
             "📸 Instagram"
         )
+
         return jsonify({"ok": True})
 
     url = extract_url(text)
 
     if not url:
+
         send_message(
             chat_id,
             "❌ الرابط غير مدعوم.\n\n"
-            "أرسل رابط فيديو عام من:\n"
+            "أرسل رابط فيديو من:\n"
             "📱 TikTok\n"
             "📸 Instagram\n\n"
             "للمساعدة أرسل /help"
         )
+
         return jsonify({"ok": True})
 
-    executor.submit(process_download, chat_id, url)
+    executor.submit(
+        process_download,
+        chat_id,
+        url
+    )
 
     return jsonify({"ok": True})
 
@@ -449,11 +575,19 @@ def webhook():
 def setup_webhook():
 
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is missing")
+
+        logger.error(
+            "BOT_TOKEN is missing"
+        )
+
         return
 
     if not APP_URL:
-        logger.error("RENDER_EXTERNAL_URL is missing")
+
+        logger.error(
+            "RENDER_EXTERNAL_URL is missing"
+        )
+
         return
 
     webhook_url = APP_URL + "/webhook"
@@ -467,15 +601,23 @@ def setup_webhook():
         data["secret_token"] = WEBHOOK_SECRET
 
     try:
+
         result = telegram_request(
             "setWebhook",
             data=data
         )
 
-        logger.info("Webhook setup successful: %s", result)
+        logger.info(
+            "Webhook setup successful: %s",
+            result
+        )
 
     except Exception as error:
-        logger.exception("WEBHOOK SETUP ERROR: %s", error)
+
+        logger.exception(
+            "WEBHOOK SETUP ERROR: %s",
+            error
+        )
 
 
 setup_webhook()

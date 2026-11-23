@@ -55,7 +55,7 @@ WELCOME_MESSAGE = (
     "المنصات المدعومة:\n"
     "📱 TikTok\n"
     "📸 Instagram\n\n"
-    "يمكنك تنزيل الفيديوهات ومنشورات الصور.\n\n"
+    "يدعم الفيديوهات ومنشورات الصور.\n\n"
     "طريقة الاستخدام:\n"
     "1. انسخ رابط المنشور.\n"
     "2. أرسله هنا.\n"
@@ -159,6 +159,13 @@ YOUTUBE_DOMAINS = (
     "youtube-nocookie.com",
 )
 
+IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+)
+
 
 def get_url(text):
 
@@ -201,19 +208,23 @@ def is_youtube_url(url):
     )
 
 
-def is_tiktok_photo_url(url):
+def is_tiktok_url(url):
 
     host = get_domain(url)
 
-    if not host:
+    return bool(
+        host and domain_matches(host, ("tiktok.com",))
+    )
+
+
+def is_tiktok_photo_url(url):
+
+    if not is_tiktok_url(url):
         return False
 
     parsed = urlparse(url)
 
-    return (
-        domain_matches(host, ("tiktok.com",))
-        and "/photo/" in parsed.path.lower()
-    )
+    return "/photo/" in parsed.path.lower()
 
 
 def extract_url(text):
@@ -235,20 +246,67 @@ def extract_url(text):
 
 
 # =========================
+# تحويل روابط TikTok المختصرة
+# =========================
+
+def resolve_tiktok_url(url):
+
+    if not is_tiktok_url(url):
+        return url
+
+    logger.info(
+        "Resolving TikTok URL"
+    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Mobile/15E148 Safari/604.1"
+        )
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=25,
+            stream=True
+        )
+
+        final_url = response.url
+        response.close()
+
+        if is_tiktok_url(final_url):
+
+            logger.info(
+                "TikTok URL resolved successfully: %s",
+                final_url
+            )
+
+            return final_url
+
+    except requests.RequestException as error:
+
+        logger.warning(
+            "TikTok URL resolution failed: %s",
+            error
+        )
+
+    return url
+
+
+# =========================
 # تنزيل صور TikTok
 # =========================
 
-IMAGE_EXTENSIONS = (
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-)
-
-
 def download_tiktok_photos(url, folder):
 
-    logger.info("Starting TikTok photo download")
+    logger.info(
+        "Starting TikTok photo download"
+    )
 
     command = [
         sys.executable,
@@ -272,6 +330,7 @@ def download_tiktok_photos(url, folder):
         )
 
     except subprocess.TimeoutExpired:
+
         raise RuntimeError(
             "Photo download timed out"
         )
@@ -279,7 +338,9 @@ def download_tiktok_photos(url, folder):
     if result.returncode != 0:
 
         error_details = (
-            result.stderr or result.stdout or "Unknown gallery-dl error"
+            result.stderr
+            or result.stdout
+            or "Unknown gallery-dl error"
         )
 
         logger.error(
@@ -297,27 +358,31 @@ def download_tiktok_photos(url, folder):
 
         for filename in filenames:
 
-            path = os.path.join(root, filename)
+            path = os.path.join(
+                root,
+                filename
+            )
 
             if (
                 os.path.isfile(path)
                 and filename.lower().endswith(IMAGE_EXTENSIONS)
                 and os.path.getsize(path) > 0
             ):
+
                 photo_files.append(path)
 
     photo_files.sort()
 
     if not photo_files:
+
         raise RuntimeError(
             "No photos were downloaded"
         )
 
     for path in photo_files:
 
-        size = os.path.getsize(path)
+        if os.path.getsize(path) > MAX_PHOTO_SIZE:
 
-        if size > MAX_PHOTO_SIZE:
             raise RuntimeError(
                 "One of the photos exceeds the upload limit"
             )
@@ -331,7 +396,7 @@ def download_tiktok_photos(url, folder):
 
 
 # =========================
-# إرسال الصور إلى تيليجرام
+# إرسال الصور
 # =========================
 
 def send_single_photo(chat_id, photo_path):
@@ -375,7 +440,6 @@ def send_single_photo(chat_id, photo_path):
 
 def send_photo_group(chat_id, photo_paths):
 
-    # إذا كانت صورة واحدة
     if len(photo_paths) == 1:
 
         send_single_photo(
@@ -385,12 +449,10 @@ def send_photo_group(chat_id, photo_paths):
 
         return
 
-    # تيليجرام يسمح بحد أقصى 10 صور في المجموعة
     for start in range(0, len(photo_paths), 10):
 
         batch = photo_paths[start:start + 10]
 
-        # الصور الكبيرة نرسلها بشكل منفصل
         if any(
             os.path.getsize(path) > 10 * 1024 * 1024
             for path in batch
@@ -492,9 +554,7 @@ def download_video(url, folder):
         video_files = [
             path for path in files
             if os.path.isfile(path)
-            and not path.endswith(
-                (".part", ".ytdl")
-            )
+            and not path.endswith((".part", ".ytdl"))
             and not path.lower().endswith(IMAGE_EXTENSIONS)
         ]
 
@@ -608,14 +668,32 @@ def process_download(chat_id, url):
 
     try:
 
+        send_message(
+            chat_id,
+            "⏳ جاري فحص الرابط..."
+        )
+
+        # تحويل الرابط المختصر قبل تحديد نوع المنشور
+        resolved_url = resolve_tiktok_url(url)
+
+        logger.info(
+            "Original URL: %s",
+            url
+        )
+
+        logger.info(
+            "Resolved URL: %s",
+            resolved_url
+        )
+
         with tempfile.TemporaryDirectory() as folder:
 
             # منشور صور TikTok
-            if is_tiktok_photo_url(url):
+            if is_tiktok_photo_url(resolved_url):
 
                 send_message(
                     chat_id,
-                    "⏳ جاري تنزيل صور المنشور..."
+                    "📸 تم التعرف على منشور صور.\nجاري تنزيل الصور..."
                 )
 
                 send_action(
@@ -624,13 +702,13 @@ def process_download(chat_id, url):
                 )
 
                 photo_paths = download_tiktok_photos(
-                    url,
+                    resolved_url,
                     folder
                 )
 
                 send_message(
                     chat_id,
-                    f"📸 تم تنزيل {len(photo_paths)} صورة، جاري إرسالها..."
+                    f"📤 تم تنزيل {len(photo_paths)} صورة، جاري إرسالها..."
                 )
 
                 send_photo_group(
@@ -648,7 +726,7 @@ def process_download(chat_id, url):
 
                 send_message(
                     chat_id,
-                    "⏳ جاري تجهيز الفيديو وتنزيله..."
+                    "⏳ جاري تنزيل الفيديو..."
                 )
 
                 send_action(
@@ -656,17 +734,13 @@ def process_download(chat_id, url):
                     "upload_video"
                 )
 
-                logger.info(
-                    "Starting video download"
-                )
-
                 video_path = download_video(
-                    url,
+                    resolved_url,
                     folder
                 )
 
                 logger.info(
-                    "Download completed. File size: %s bytes",
+                    "Video downloaded: %s bytes",
                     os.path.getsize(video_path)
                 )
 
@@ -714,7 +788,9 @@ def process_download(chat_id, url):
 
         elif "unsupported url" in error_text:
 
-            message = "❌ الرابط غير مدعوم."
+            message = (
+                "❌ تعذر التعرف على نوع المنشور أو أن الرابط غير مدعوم."
+            )
 
         elif "telegram" in error_text:
 

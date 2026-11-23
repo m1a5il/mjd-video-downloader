@@ -20,9 +20,9 @@ from yt_dlp.networking.impersonate import ImpersonateTarget
 from flask import Flask, request, jsonify
 
 
-# =========================
-# إعدادات البوت
-# =========================
+# ==================================================
+# SETTINGS
+# ==================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 APP_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
@@ -36,8 +36,6 @@ API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_PHOTO_SIZE = 49 * 1024 * 1024
 MAX_QUEUE_SIZE = 30
-
-# عدد التنزيلات المتزامنة
 MAX_CONCURRENT_DOWNLOADS = 3
 
 app = Flask(__name__)
@@ -49,11 +47,18 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+# ==================================================
+# QUEUE AND WORKER STATE
+# ==================================================
+
 download_queue = queue.Queue()
-queue_lock = threading.Lock()
 
 active_download_count = 0
 active_download_lock = threading.Lock()
+
+workers_lock = threading.Lock()
+worker_threads = []
 
 
 def get_active_download_count():
@@ -61,18 +66,64 @@ def get_active_download_count():
         return active_download_count
 
 
-# =========================
-# قاعدة بيانات الإحصائيات
-# =========================
+def ensure_workers_started():
+    """
+    Start workers inside the Gunicorn application process.
+    This function is called before every Flask request.
+    """
+
+    global worker_threads
+
+    with workers_lock:
+
+        worker_threads = [
+            worker for worker in worker_threads
+            if worker.is_alive()
+        ]
+
+        while len(worker_threads) < MAX_CONCURRENT_DOWNLOADS:
+
+            worker_number = len(worker_threads) + 1
+
+            worker = threading.Thread(
+                target=download_queue_worker,
+                name=f"download-worker-{worker_number}",
+                daemon=True
+            )
+
+            worker.start()
+            worker_threads.append(worker)
+
+        logger.info(
+            "Workers ready: count=%s pid=%s",
+            len(worker_threads),
+            os.getpid()
+        )
+
+
+@app.before_request
+def initialize_workers_for_request():
+    ensure_workers_started()
+
+
+# ==================================================
+# DATABASE
+# ==================================================
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30
+    )
+
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
+
     return conn
 
 
 def init_database():
+
     with closing(get_db()) as conn:
 
         conn.execute("PRAGMA journal_mode=WAL")
@@ -156,6 +207,7 @@ def create_download_record(
         ))
 
         conn.commit()
+
         return cursor.lastrowid
 
 
@@ -252,52 +304,39 @@ def build_statistics_message():
     message = (
         "📊 إحصائيات MJD Video Downloader\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-
         "👥 المستخدمون\n"
         f"إجمالي المستخدمين: {stats['users']}\n\n"
-
         "📥 إجمالي التنزيلات\n"
         f"كل الطلبات: {stats['total']}\n"
         f"✅ ناجحة: {stats['success']}\n"
         f"❌ فاشلة: {stats['failed']}\n"
         f"⏳ قيد الانتظار أو التنفيذ: {stats['pending']}\n\n"
-
         "📱 حسب المنصة\n"
         f"TikTok: {stats['tiktok']}\n"
         f"Instagram: {stats['instagram']}\n\n"
-
         "📅 إحصائيات اليوم\n"
         f"الطلبات: {stats['today_total']}\n"
         f"الناجحة: {stats['today_success']}\n"
         f"الفاشلة: {stats['today_failed']}\n\n"
-
         "⚙️ حالة الطابور الآن\n"
         f"التنزيلات الجارية: {running}/{MAX_CONCURRENT_DOWNLOADS}\n"
         f"طلبات منتظرة: {waiting}\n\n"
-
         "━━━━━━━━━━━━━━━━━━\n"
         "🧾 آخر 10 عمليات تنزيل\n"
     )
 
     if not stats["recent"]:
-
         message += "\nلا توجد عمليات مسجلة حتى الآن."
 
     else:
 
         for index, item in enumerate(stats["recent"], 1):
 
-            customer = (
-                item["customer_name"]
-                or "مستخدم غير معروف"
-            )
-
+            customer = item["customer_name"] or "مستخدم غير معروف"
             username = item["username"]
 
             if username:
                 customer += f" (@{username})"
-
-            platform = item["platform"] or "غير معروف"
 
             status = {
                 "queued": "⏳ في الانتظار",
@@ -306,19 +345,14 @@ def build_statistics_message():
                 "failed": "❌ فاشل"
             }.get(item["status"], item["status"])
 
-            created_at = item["created_at"] or ""
-
             message += (
                 f"\n\n{index}. {customer}\n"
-                f"المنصة: {platform}\n"
+                f"المنصة: {item['platform'] or 'غير معروف'}\n"
                 f"الحالة: {status}\n"
-                f"التاريخ: {created_at}"
+                f"التاريخ: {item['created_at'] or ''}"
             )
 
-    message += (
-        "\n\n━━━━━━━━━━━━━━━━━━\n"
-        "MJD | Admin Statistics"
-    )
+    message += "\n\n━━━━━━━━━━━━━━━━━━\nMJD | Admin Statistics"
 
     return message
 
@@ -326,9 +360,9 @@ def build_statistics_message():
 init_database()
 
 
-# =========================
-# رسائل البوت
-# =========================
+# ==================================================
+# BOT MESSAGES
+# ==================================================
 
 WELCOME_MESSAGE = (
     "مرحباً بك في MJD Video Downloader\n"
@@ -363,11 +397,14 @@ HELP_MESSAGE = (
 )
 
 
-# =========================
-# التواصل مع تيليجرام
-# =========================
+# ==================================================
+# TELEGRAM API
+# ==================================================
 
 def telegram_request(method, data=None, files=None, timeout=60):
+
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not configured")
 
     response = requests.post(
         f"{API_URL}/{method}",
@@ -378,7 +415,6 @@ def telegram_request(method, data=None, files=None, timeout=60):
 
     try:
         result = response.json()
-
     except Exception:
         raise RuntimeError(
             f"Telegram returned HTTP {response.status_code}"
@@ -410,8 +446,12 @@ def send_message(chat_id, text):
             }
         )
 
-    except Exception as error:
-        logger.error("SEND MESSAGE ERROR: %s", error)
+    except Exception:
+
+        logger.exception(
+            "SEND MESSAGE ERROR: chat_id=%s",
+            chat_id
+        )
 
 
 def send_action(chat_id, action="upload_video"):
@@ -427,12 +467,12 @@ def send_action(chat_id, action="upload_video"):
         )
 
     except Exception:
-        pass
+        logger.exception("SEND ACTION ERROR")
 
 
-# =========================
-# التحقق من الروابط
-# =========================
+# ==================================================
+# URL VALIDATION
+# ==================================================
 
 ALLOWED_DOMAINS = (
     "instagram.com",
@@ -510,9 +550,7 @@ def is_tiktok_photo_url(url):
     if not is_tiktok_url(url):
         return False
 
-    parsed = urlparse(url)
-
-    return "/photo/" in parsed.path.lower()
+    return "/photo/" in urlparse(url).path.lower()
 
 
 def extract_url(text):
@@ -524,10 +562,7 @@ def extract_url(text):
 
     host = get_domain(url)
 
-    if not host:
-        return None
-
-    if domain_matches(host, ALLOWED_DOMAINS):
+    if host and domain_matches(host, ALLOWED_DOMAINS):
         return url
 
     return None
@@ -540,18 +575,15 @@ def get_platform(url):
     if domain_matches(host, ("tiktok.com",)):
         return "TikTok"
 
-    if domain_matches(
-        host,
-        ("instagram.com", "instagr.am")
-    ):
+    if domain_matches(host, ("instagram.com", "instagr.am")):
         return "Instagram"
 
     return "Unknown"
 
 
-# =========================
-# تحويل روابط TikTok المختصرة
-# =========================
+# ==================================================
+# TIKTOK URL RESOLUTION
+# ==================================================
 
 def resolve_tiktok_url(url):
 
@@ -582,27 +614,19 @@ def resolve_tiktok_url(url):
         response.close()
 
         if is_tiktok_url(final_url):
-
-            logger.info(
-                "TikTok URL resolved successfully: %s",
-                final_url
-            )
-
+            logger.info("TikTok URL resolved successfully")
             return final_url
 
-    except requests.RequestException as error:
+    except requests.RequestException:
 
-        logger.warning(
-            "TikTok URL resolution failed: %s",
-            error
-        )
+        logger.exception("TikTok URL resolution failed")
 
     return url
 
 
-# =========================
-# تنزيل صور TikTok
-# =========================
+# ==================================================
+# TIKTOK PHOTO DOWNLOAD
+# ==================================================
 
 def download_tiktok_photos(url, folder):
 
@@ -634,7 +658,7 @@ def download_tiktok_photos(url, folder):
 
     if result.returncode != 0:
 
-        error_details = (
+        details = (
             result.stderr
             or result.stdout
             or "Unknown gallery-dl error"
@@ -642,7 +666,7 @@ def download_tiktok_photos(url, folder):
 
         logger.error(
             "GALLERY-DL ERROR: %s",
-            error_details[-2000:]
+            details[-2000:]
         )
 
         raise RuntimeError("TikTok photo download failed")
@@ -674,17 +698,14 @@ def download_tiktok_photos(url, folder):
                 "One of the photos exceeds the upload limit"
             )
 
-    logger.info(
-        "TikTok photos downloaded: %s",
-        len(photo_files)
-    )
+    logger.info("TikTok photos downloaded: %s", len(photo_files))
 
     return photo_files
 
 
-# =========================
-# إرسال الصور
-# =========================
+# ==================================================
+# PHOTO UPLOAD
+# ==================================================
 
 def send_single_photo(chat_id, photo_path):
 
@@ -780,9 +801,9 @@ def send_photo_group(chat_id, photo_paths):
                 photo_file.close()
 
 
-# =========================
-# تنزيل الفيديو
-# =========================
+# ==================================================
+# VIDEO DOWNLOAD
+# ==================================================
 
 def download_video(url, folder):
 
@@ -819,9 +840,11 @@ def download_video(url, folder):
 
         video_files = [
             path for path in files
-            if os.path.isfile(path)
-            and not path.endswith((".part", ".ytdl"))
-            and not path.lower().endswith(IMAGE_EXTENSIONS)
+            if (
+                os.path.isfile(path)
+                and not path.endswith((".part", ".ytdl"))
+                and not path.lower().endswith(IMAGE_EXTENSIONS)
+            )
         ]
 
         if not video_files:
@@ -844,9 +867,9 @@ def download_video(url, folder):
         return video_path
 
 
-# =========================
-# إرسال الفيديو
-# =========================
+# ==================================================
+# VIDEO UPLOAD
+# ==================================================
 
 def upload_video(chat_id, video_path):
 
@@ -855,7 +878,6 @@ def upload_video(chat_id, video_path):
     if extension == ".mp4":
         method = "sendVideo"
         field = "video"
-
     else:
         method = "sendDocument"
         field = "document"
@@ -901,9 +923,9 @@ def upload_video(chat_id, video_path):
             )
 
 
-# =========================
-# معالجة طلب التنزيل
-# =========================
+# ==================================================
+# DOWNLOAD PROCESSING
+# ==================================================
 
 def process_download(chat_id, url, download_id):
 
@@ -918,12 +940,17 @@ def process_download(chat_id, url, download_id):
 
         resolved_url = resolve_tiktok_url(url)
 
+        logger.info(
+            "Download started: id=%s platform=%s",
+            download_id,
+            get_platform(resolved_url)
+        )
+
         logger.info("Original URL: %s", url)
         logger.info("Resolved URL: %s", resolved_url)
 
         with tempfile.TemporaryDirectory() as folder:
 
-            # منشور صور TikTok
             if is_tiktok_photo_url(resolved_url):
 
                 send_message(
@@ -952,7 +979,6 @@ def process_download(chat_id, url, download_id):
                     "✅ تم إرسال جميع صور المنشور."
                 )
 
-            # منشور فيديو
             else:
 
                 send_message(
@@ -968,7 +994,8 @@ def process_download(chat_id, url, download_id):
                 )
 
                 logger.info(
-                    "Video downloaded: %s bytes",
+                    "Video downloaded: id=%s bytes=%s",
+                    download_id,
                     os.path.getsize(video_path)
                 )
 
@@ -979,7 +1006,10 @@ def process_download(chat_id, url, download_id):
 
                 upload_video(chat_id, video_path)
 
-                logger.info("Video sent successfully")
+                logger.info(
+                    "Video sent successfully: id=%s",
+                    download_id
+                )
 
         update_download_status(download_id, "success")
 
@@ -987,7 +1017,11 @@ def process_download(chat_id, url, download_id):
 
         update_download_status(download_id, "failed")
 
-        logger.exception("DOWNLOAD ERROR: %r", error)
+        logger.exception(
+            "DOWNLOAD ERROR: id=%s error=%r",
+            download_id,
+            error
+        )
 
         error_text = str(error).lower()
 
@@ -1024,30 +1058,40 @@ def process_download(chat_id, url, download_id):
         send_message(chat_id, message)
 
 
-# =========================
-# عمال معالجة الطابور
-# =========================
+# ==================================================
+# QUEUE WORKERS
+# ==================================================
 
 def download_queue_worker():
 
     global active_download_count
 
+    worker_name = threading.current_thread().name
+
     logger.info(
-        "Download queue worker started"
+        "Worker started: name=%s pid=%s",
+        worker_name,
+        os.getpid()
     )
 
     while True:
 
-        chat_id, url, download_id = download_queue.get()
-
-        with active_download_lock:
-            active_download_count += 1
+        chat_id = None
+        url = None
+        download_id = None
 
         try:
 
+            chat_id, url, download_id = download_queue.get()
+
+            with active_download_lock:
+                active_download_count += 1
+
             logger.info(
-                "Processing download: chat_id=%s active=%s waiting=%s",
+                "Processing download: id=%s chat_id=%s pid=%s active=%s waiting=%s",
+                download_id,
                 chat_id,
+                os.getpid(),
                 get_active_download_count(),
                 download_queue.qsize()
             )
@@ -1060,44 +1104,57 @@ def download_queue_worker():
 
         except Exception:
 
-            logger.exception("QUEUE WORKER ERROR")
+            logger.exception(
+                "QUEUE WORKER ERROR: worker=%s",
+                worker_name
+            )
 
-            try:
-                update_download_status(
-                    download_id,
-                    "failed"
-                )
-            except Exception:
-                logger.exception("FAILED TO UPDATE DOWNLOAD STATUS")
+            if download_id:
+
+                try:
+                    update_download_status(
+                        download_id,
+                        "failed"
+                    )
+                except Exception:
+                    logger.exception("FAILED TO UPDATE DOWNLOAD STATUS")
 
         finally:
 
-            with active_download_lock:
-                active_download_count -= 1
+            if download_id is not None:
 
-            download_queue.task_done()
+                with active_download_lock:
+                    active_download_count = max(
+                        0,
+                        active_download_count - 1
+                    )
 
-
-# تشغيل 3 عمال بالتوازي
-for worker_number in range(MAX_CONCURRENT_DOWNLOADS):
-
-    worker_thread = threading.Thread(
-        target=download_queue_worker,
-        name=f"download-worker-{worker_number + 1}",
-        daemon=True
-    )
-
-    worker_thread.start()
+                download_queue.task_done()
 
 
-# =========================
-# استقبال رسائل تيليجرام
-# =========================
+# ==================================================
+# WEB ROUTES
+# ==================================================
 
 @app.route("/", methods=["GET"])
 def home():
 
     return "MJD Video Downloader is running."
+
+
+@app.route("/health", methods=["GET"])
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "pid": os.getpid(),
+        "workers": len([
+            worker for worker in worker_threads
+            if worker.is_alive()
+        ]),
+        "active_downloads": get_active_download_count(),
+        "waiting_downloads": download_queue.qsize()
+    })
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1111,6 +1168,7 @@ def webhook():
         )
 
         if received_secret != WEBHOOK_SECRET:
+            logger.warning("Invalid webhook secret")
             return jsonify({"ok": False}), 403
 
     update = request.get_json(silent=True) or {}
@@ -1168,7 +1226,6 @@ def webhook():
 
         return jsonify({"ok": True})
 
-    # إحصائيات الإدارة فقط
     if command == "/stats":
 
         if not ADMIN_ID:
@@ -1188,19 +1245,16 @@ def webhook():
             )
 
             logger.warning(
-                "Unauthorized stats command from chat_id=%s",
-                chat_id
+                "Unauthorized stats command"
             )
 
             return jsonify({"ok": True})
 
         try:
 
-            stats_message = build_statistics_message()
-
             send_message(
                 chat_id,
-                stats_message
+                build_statistics_message()
             )
 
         except Exception:
@@ -1245,8 +1299,9 @@ def webhook():
 
     platform = get_platform(url)
 
-    # إضافة الطلب إلى الطابور
-    with queue_lock:
+    # Queue insertion is protected so simultaneous
+    # webhook requests cannot exceed the queue limit.
+    with workers_lock:
 
         waiting_count = download_queue.qsize()
         running_count = get_active_download_count()
@@ -1260,11 +1315,6 @@ def webhook():
             )
 
             return jsonify({"ok": True})
-
-        if running_count < MAX_CONCURRENT_DOWNLOADS:
-            position = 1
-        else:
-            position = waiting_count + 1
 
         try:
 
@@ -1292,14 +1342,19 @@ def webhook():
             download_id
         ))
 
+        waiting_after_insert = download_queue.qsize()
+
     if running_count < MAX_CONCURRENT_DOWNLOADS:
+        position = 1
 
         confirmation = (
             "✅ تم استلام طلبك.\n"
-            "🚀 يوجد مسار تنزيل متاح، وسيبدأ طلبك قريباً."
+            "🚀 سيبدأ التنزيل قريباً."
         )
 
     else:
+
+        position = waiting_after_insert
 
         confirmation = (
             "✅ تم استلام طلبك وإضافته إلى طابور التحميل.\n"
@@ -1307,32 +1362,31 @@ def webhook():
             "سيبدأ التنزيل عند توفر مسار."
         )
 
-    send_message(chat_id, confirmation)
-
     logger.info(
-        "Download queued: chat_id=%s position=%s active=%s waiting=%s",
+        "QUEUE INSERTED: id=%s chat_id=%s pid=%s waiting=%s active=%s",
+        download_id,
         chat_id,
-        position,
-        get_active_download_count(),
-        download_queue.qsize()
+        os.getpid(),
+        download_queue.qsize(),
+        get_active_download_count()
     )
+
+    send_message(chat_id, confirmation)
 
     return jsonify({"ok": True})
 
 
-# =========================
-# إعداد Webhook
-# =========================
+# ==================================================
+# WEBHOOK SETUP
+# ==================================================
 
 def setup_webhook():
 
     if not BOT_TOKEN:
-
         logger.error("BOT_TOKEN is missing")
         return
 
     if not APP_URL:
-
         logger.error("RENDER_EXTERNAL_URL is missing")
         return
 
@@ -1358,12 +1412,9 @@ def setup_webhook():
             result
         )
 
-    except Exception as error:
+    except Exception:
 
-        logger.exception(
-            "WEBHOOK SETUP ERROR: %s",
-            error
-        )
+        logger.exception("WEBHOOK SETUP ERROR")
 
 
 setup_webhook()

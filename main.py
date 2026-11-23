@@ -23,7 +23,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-MAX_FILE_SIZE = 49 * 1024 * 1024  # أقل من 50 MB
+MAX_FILE_SIZE = 49 * 1024 * 1024
 
 app = Flask(__name__)
 
@@ -36,6 +36,46 @@ logger = logging.getLogger(__name__)
 
 executor = ThreadPoolExecutor(max_workers=2)
 download_lock = threading.Lock()
+
+
+# =========================
+# رسائل البوت
+# =========================
+
+WELCOME_MESSAGE = (
+    "مرحباً بك في MJD Video Downloader\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+    "حمّل مقاطعك بسهولة وسرعة!\n\n"
+    "المنصات المدعومة:\n"
+    "📱 TikTok\n"
+    "📸 Instagram\n\n"
+    "طريقة الاستخدام:\n"
+    "1. انسخ رابط الفيديو العام.\n"
+    "2. أرسله هنا.\n"
+    "3. انتظر وصول الفيديو إليك.\n\n"
+    "للمساعدة أرسل /help\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "MJD | Video Downloader"
+)
+
+HELP_MESSAGE = (
+    "📖 طريقة استخدام MJD Video Downloader\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+    "1️⃣ افتح الفيديو في TikTok أو Instagram.\n"
+    "2️⃣ اضغط على مشاركة ثم نسخ الرابط.\n"
+    "3️⃣ أرسل الرابط إلى البوت.\n"
+    "4️⃣ انتظر حتى يصلك الفيديو.\n\n"
+    "✅ المنصات المدعومة:\n"
+    "• TikTok\n"
+    "• Instagram\n\n"
+    "❌ YouTube غير مدعوم حالياً.\n\n"
+    "ملاحظات:\n"
+    "• يجب أن يكون الفيديو عاماً.\n"
+    "• لا يمكن تنزيل المحتوى الخاص أو المحمي.\n"
+    "• الحد الأقصى لحجم الفيديو 49 MB.\n\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "MJD | Video Downloader"
+)
 
 
 # =========================
@@ -95,38 +135,70 @@ def send_action(chat_id):
 # =========================
 
 ALLOWED_DOMAINS = (
-    "youtube.com",
-    "youtu.be",
     "instagram.com",
     "instagr.am",
     "tiktok.com",
 )
 
+YOUTUBE_DOMAINS = (
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+)
 
-def extract_url(text):
+
+def get_url(text):
     match = re.search(r"https?://\S+", text or "")
 
     if not match:
         return None
 
-    url = match.group(0).rstrip(".,!?)]}،")
+    return match.group(0).rstrip(".,!?)]}،")
 
+
+def get_domain(url):
     try:
         parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
 
-        if parsed.scheme != "https" and parsed.scheme != "http":
+        if parsed.scheme not in ("https", "http"):
             return None
 
-        allowed = any(
-            host == domain or host.endswith("." + domain)
-            for domain in ALLOWED_DOMAINS
-        )
-
-        return url if allowed else None
+        return (parsed.hostname or "").lower()
 
     except Exception:
         return None
+
+
+def domain_matches(host, domains):
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in domains
+    )
+
+
+def is_youtube_url(url):
+    host = get_domain(url)
+
+    return bool(
+        host and domain_matches(host, YOUTUBE_DOMAINS)
+    )
+
+
+def extract_url(text):
+    url = get_url(text)
+
+    if not url:
+        return None
+
+    host = get_domain(url)
+
+    if not host:
+        return None
+
+    if domain_matches(host, ALLOWED_DOMAINS):
+        return url
+
+    return None
 
 
 # =========================
@@ -136,19 +208,14 @@ def extract_url(text):
 def download_video(url, folder):
     options = {
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
-
-        # اختيار أفضل صيغة فيديو متاحة في ملف واحد
         "format": "best[ext=mp4]/best",
-
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-
         "max_filesize": MAX_FILE_SIZE,
         "socket_timeout": 30,
         "retries": 2,
         "fragment_retries": 2,
-
         "restrictfilenames": True,
         "overwrites": True,
     }
@@ -176,7 +243,6 @@ def download_video(url, folder):
         )
 
         video_path = video_files[0]
-
         size = os.path.getsize(video_path)
 
         if size <= 0:
@@ -222,8 +288,6 @@ def upload_video(chat_id, video_path):
             )
 
         except Exception:
-            # إذا رفض تيليجرام إرسال الملف كفيديو،
-            # نحاول إرساله كمستند.
             if method != "sendVideo":
                 raise
 
@@ -285,7 +349,6 @@ def process_download(chat_id, url):
 
     except Exception as error:
 
-        # تسجيل السبب الحقيقي في Render Logs
         logger.exception("DOWNLOAD ERROR: %r", error)
 
         error_text = str(error).lower()
@@ -305,7 +368,7 @@ def process_download(chat_id, url):
         else:
             message = (
                 "❌ تعذر تنزيل الفيديو.\n"
-                "سجل الخطأ موجود في Render Logs."
+                "تأكد من أن الرابط عام وحاول مرة أخرى."
             )
 
         send_message(chat_id, message)
@@ -335,38 +398,35 @@ def webhook():
             return jsonify({"ok": False}), 403
 
     update = request.get_json(silent=True) or {}
-
     message = update.get("message")
 
     if not message:
         return jsonify({"ok": True})
 
     chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "")
+    text = message.get("text", "").strip()
 
     if not chat_id:
         return jsonify({"ok": True})
 
     if text.startswith("/start"):
-        send_message(
-            chat_id,
-            "أهلاً بك في MJD Video Downloader\n\n"
-            "أرسل رابط فيديو عام من:\n"
-            "Instagram\n"
-            "TikTok\n"
-            "YouTube\n\n"
-            "وسأحاول تجهيزه لك."
-        )
-
+        send_message(chat_id, WELCOME_MESSAGE)
         return jsonify({"ok": True})
 
     if text.startswith("/help"):
+        send_message(chat_id, HELP_MESSAGE)
+        return jsonify({"ok": True})
+
+    url = get_url(text)
+
+    if url and is_youtube_url(url):
         send_message(
             chat_id,
-            "أرسل رابط فيديو عام من المواقع المدعومة.\n"
-            "لا يمكن تنزيل المحتوى الخاص أو المحمي."
+            "❌ عذراً، YouTube غير مدعوم حالياً.\n\n"
+            "المنصات المتاحة حالياً:\n"
+            "📱 TikTok\n"
+            "📸 Instagram"
         )
-
         return jsonify({"ok": True})
 
     url = extract_url(text)
@@ -374,9 +434,12 @@ def webhook():
     if not url:
         send_message(
             chat_id,
-            "❌ أرسل رابط فيديو صحيح من Instagram أو TikTok أو YouTube."
+            "❌ الرابط غير مدعوم.\n\n"
+            "أرسل رابط فيديو عام من:\n"
+            "📱 TikTok\n"
+            "📸 Instagram\n\n"
+            "للمساعدة أرسل /help"
         )
-
         return jsonify({"ok": True})
 
     executor.submit(process_download, chat_id, url)

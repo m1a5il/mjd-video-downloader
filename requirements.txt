@@ -4,3 +4,4 @@ gunicorn
 requests
 yt-dlp[default]
 curl-cffi
+gallery-dl

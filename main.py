@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from flask import Flask, request, jsonify
 
 
@@ -226,9 +227,6 @@ def download_video(url, folder):
 
         "format": "best[ext=mp4]/best",
 
-        # تحسين الاتصال بتيك توك
-        "impersonate": "chrome",
-
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -242,6 +240,9 @@ def download_video(url, folder):
         "restrictfilenames": True,
         "overwrites": True,
     }
+
+    # استخدام نوع ImpersonateTarget الصحيح
+    options["impersonate"] = ImpersonateTarget.from_str("chrome")
 
     with yt_dlp.YoutubeDL(options) as ydl:
 
@@ -509,8 +510,10 @@ def webhook():
     if not chat_id:
         return jsonify({"ok": True})
 
+    command = text.split(maxsplit=1)[0].split("@")[0] if text else ""
+
     # أمر البداية
-    if text.split()[0].split("@")[0] == "/start" if text else False:
+    if command == "/start":
 
         send_message(
             chat_id,
@@ -520,7 +523,7 @@ def webhook():
         return jsonify({"ok": True})
 
     # أمر المساعدة
-    if text.split()[0].split("@")[0] == "/help" if text else False:
+    if command == "/help":
 
         send_message(
             chat_id,

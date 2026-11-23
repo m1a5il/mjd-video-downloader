@@ -11,6 +11,7 @@ import subprocess
 import queue
 import sqlite3
 
+from contextlib import closing
 from urllib.parse import urlparse
 
 import requests
@@ -36,6 +37,9 @@ MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_PHOTO_SIZE = 49 * 1024 * 1024
 MAX_QUEUE_SIZE = 30
 
+# عدد التنزيلات المتزامنة
+MAX_CONCURRENT_DOWNLOADS = 3
+
 app = Flask(__name__)
 
 logging.basicConfig(
@@ -47,7 +51,14 @@ logger = logging.getLogger(__name__)
 
 download_queue = queue.Queue()
 queue_lock = threading.Lock()
-active_download = threading.Event()
+
+active_download_count = 0
+active_download_lock = threading.Lock()
+
+
+def get_active_download_count():
+    with active_download_lock:
+        return active_download_count
 
 
 # =========================
@@ -57,11 +68,14 @@ active_download = threading.Event()
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
 def init_database():
-    with get_db() as conn:
+    with closing(get_db()) as conn:
+
+        conn.execute("PRAGMA journal_mode=WAL")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -92,7 +106,9 @@ def init_database():
 
 
 def save_user(chat_id, customer_name, username):
-    with get_db() as conn:
+
+    with closing(get_db()) as conn:
+
         conn.execute("""
             INSERT INTO users (
                 chat_id,
@@ -120,7 +136,9 @@ def create_download_record(
     username,
     platform
 ):
-    with get_db() as conn:
+
+    with closing(get_db()) as conn:
+
         cursor = conn.execute("""
             INSERT INTO downloads (
                 chat_id,
@@ -142,12 +160,14 @@ def create_download_record(
 
 
 def update_download_status(download_id, status):
+
     if not download_id:
         return
 
-    with get_db() as conn:
+    with closing(get_db()) as conn:
 
         if status in ("success", "failed"):
+
             conn.execute("""
                 UPDATE downloads
                 SET status = ?,
@@ -156,6 +176,7 @@ def update_download_status(download_id, status):
             """, (status, download_id))
 
         else:
+
             conn.execute("""
                 UPDATE downloads
                 SET status = ?
@@ -167,7 +188,7 @@ def update_download_status(download_id, status):
 
 def get_statistics():
 
-    with get_db() as conn:
+    with closing(get_db()) as conn:
 
         users_count = conn.execute("""
             SELECT COUNT(*) AS total
@@ -226,7 +247,7 @@ def build_statistics_message():
     stats = get_statistics()
 
     waiting = download_queue.qsize()
-    running = 1 if active_download.is_set() else 0
+    running = get_active_download_count()
 
     message = (
         "📊 إحصائيات MJD Video Downloader\n"
@@ -251,7 +272,7 @@ def build_statistics_message():
         f"الفاشلة: {stats['today_failed']}\n\n"
 
         "⚙️ حالة الطابور الآن\n"
-        f"طلب قيد التنفيذ: {running}\n"
+        f"التنزيلات الجارية: {running}/{MAX_CONCURRENT_DOWNLOADS}\n"
         f"طلبات منتظرة: {waiting}\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
@@ -259,9 +280,11 @@ def build_statistics_message():
     )
 
     if not stats["recent"]:
+
         message += "\nلا توجد عمليات مسجلة حتى الآن."
 
     else:
+
         for index, item in enumerate(stats["recent"], 1):
 
             customer = (
@@ -300,7 +323,6 @@ def build_statistics_message():
     return message
 
 
-# إنشاء قاعدة البيانات عند تشغيل التطبيق
 init_database()
 
 
@@ -379,6 +401,7 @@ def telegram_request(method, data=None, files=None, timeout=60):
 def send_message(chat_id, text):
 
     try:
+
         telegram_request(
             "sendMessage",
             data={
@@ -394,6 +417,7 @@ def send_message(chat_id, text):
 def send_action(chat_id, action="upload_video"):
 
     try:
+
         telegram_request(
             "sendChatAction",
             data={
@@ -431,6 +455,7 @@ IMAGE_EXTENSIONS = (
 
 
 def get_url(text):
+
     match = re.search(r"https?://\S+", text or "")
 
     if not match:
@@ -442,6 +467,7 @@ def get_url(text):
 def get_domain(url):
 
     try:
+
         parsed = urlparse(url)
 
         if parsed.scheme not in ("https", "http"):
@@ -887,7 +913,7 @@ def process_download(chat_id, url, download_id):
 
         send_message(
             chat_id,
-            "⏳ بدأ دورك، جاري فحص الرابط..."
+            "⏳ بدأ تنزيل طلبك..."
         )
 
         resolved_url = resolve_tiktok_url(url)
@@ -999,24 +1025,30 @@ def process_download(chat_id, url, download_id):
 
 
 # =========================
-# عامل معالجة الطابور
+# عمال معالجة الطابور
 # =========================
 
 def download_queue_worker():
 
-    logger.info("Download queue worker started")
+    global active_download_count
+
+    logger.info(
+        "Download queue worker started"
+    )
 
     while True:
 
         chat_id, url, download_id = download_queue.get()
 
-        active_download.set()
+        with active_download_lock:
+            active_download_count += 1
 
         try:
 
             logger.info(
-                "Processing queued download for chat_id=%s; waiting=%s",
+                "Processing download: chat_id=%s active=%s waiting=%s",
                 chat_id,
+                get_active_download_count(),
                 download_queue.qsize()
             )
 
@@ -1030,24 +1062,32 @@ def download_queue_worker():
 
             logger.exception("QUEUE WORKER ERROR")
 
-            update_download_status(
-                download_id,
-                "failed"
-            )
+            try:
+                update_download_status(
+                    download_id,
+                    "failed"
+                )
+            except Exception:
+                logger.exception("FAILED TO UPDATE DOWNLOAD STATUS")
 
         finally:
 
-            active_download.clear()
+            with active_download_lock:
+                active_download_count -= 1
+
             download_queue.task_done()
 
 
-queue_thread = threading.Thread(
-    target=download_queue_worker,
-    name="download-queue-worker",
-    daemon=True
-)
+# تشغيل 3 عمال بالتوازي
+for worker_number in range(MAX_CONCURRENT_DOWNLOADS):
 
-queue_thread.start()
+    worker_thread = threading.Thread(
+        target=download_queue_worker,
+        name=f"download-worker-{worker_number + 1}",
+        daemon=True
+    )
+
+    worker_thread.start()
 
 
 # =========================
@@ -1209,6 +1249,7 @@ def webhook():
     with queue_lock:
 
         waiting_count = download_queue.qsize()
+        running_count = get_active_download_count()
 
         if waiting_count >= MAX_QUEUE_SIZE:
 
@@ -1220,11 +1261,10 @@ def webhook():
 
             return jsonify({"ok": True})
 
-        position = (
-            waiting_count
-            + (1 if active_download.is_set() else 0)
-            + 1
-        )
+        if running_count < MAX_CONCURRENT_DOWNLOADS:
+            position = 1
+        else:
+            position = waiting_count + 1
 
         try:
 
@@ -1252,27 +1292,28 @@ def webhook():
             download_id
         ))
 
-    if position == 1:
+    if running_count < MAX_CONCURRENT_DOWNLOADS:
 
         confirmation = (
             "✅ تم استلام طلبك.\n"
-            "📥 طلبك هو التالي وسيبدأ التحميل قريباً."
+            "🚀 يوجد مسار تنزيل متاح، وسيبدأ طلبك قريباً."
         )
 
     else:
 
         confirmation = (
             "✅ تم استلام طلبك وإضافته إلى طابور التحميل.\n"
-            f"📍 ترتيبك التقريبي: {position}\n"
-            "سيبدأ التحميل تلقائياً عند وصول دورك."
+            f"📍 ترتيبك التقريبي في الانتظار: {position}\n"
+            "سيبدأ التنزيل عند توفر مسار."
         )
 
     send_message(chat_id, confirmation)
 
     logger.info(
-        "Download request queued for chat_id=%s; position=%s; waiting=%s",
+        "Download queued: chat_id=%s position=%s active=%s waiting=%s",
         chat_id,
         position,
+        get_active_download_count(),
         download_queue.qsize()
     )
 

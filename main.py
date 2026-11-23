@@ -2,9 +2,12 @@
 import os
 import re
 import glob
+import json
+import sys
 import logging
 import tempfile
 import threading
+import subprocess
 
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +29,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
+MAX_PHOTO_SIZE = 49 * 1024 * 1024
 
 app = Flask(__name__)
 
@@ -51,10 +55,11 @@ WELCOME_MESSAGE = (
     "المنصات المدعومة:\n"
     "📱 TikTok\n"
     "📸 Instagram\n\n"
+    "يمكنك تنزيل الفيديوهات ومنشورات الصور.\n\n"
     "طريقة الاستخدام:\n"
-    "1. انسخ رابط الفيديو.\n"
+    "1. انسخ رابط المنشور.\n"
     "2. أرسله هنا.\n"
-    "3. انتظر وصول الفيديو إليك.\n\n"
+    "3. انتظر وصول المحتوى إليك.\n\n"
     "للمساعدة أرسل /help\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "MJD | Video Downloader"
@@ -63,13 +68,14 @@ WELCOME_MESSAGE = (
 HELP_MESSAGE = (
     "📖 طريقة استخدام MJD Video Downloader\n"
     "━━━━━━━━━━━━━━━━━━\n\n"
-    "1️⃣ افتح الفيديو في TikTok أو Instagram.\n"
+    "1️⃣ افتح المنشور في TikTok أو Instagram.\n"
     "2️⃣ اضغط على مشاركة ثم نسخ الرابط.\n"
     "3️⃣ أرسل الرابط إلى البوت.\n"
-    "4️⃣ انتظر وصول الفيديو إليك.\n\n"
+    "4️⃣ انتظر وصول المحتوى إليك.\n\n"
     "✅ المنصات المدعومة:\n"
     "• TikTok\n"
     "• Instagram\n\n"
+    "يدعم البوت فيديوهات TikTok ومنشورات الصور.\n\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "MJD | Video Downloader"
 )
@@ -122,14 +128,14 @@ def send_message(chat_id, text):
         logger.error("SEND MESSAGE ERROR: %s", error)
 
 
-def send_action(chat_id):
+def send_action(chat_id, action="upload_video"):
 
     try:
         telegram_request(
             "sendChatAction",
             data={
                 "chat_id": chat_id,
-                "action": "upload_video"
+                "action": action
             }
         )
 
@@ -195,6 +201,21 @@ def is_youtube_url(url):
     )
 
 
+def is_tiktok_photo_url(url):
+
+    host = get_domain(url)
+
+    if not host:
+        return False
+
+    parsed = urlparse(url)
+
+    return (
+        domain_matches(host, ("tiktok.com",))
+        and "/photo/" in parsed.path.lower()
+    )
+
+
 def extract_url(text):
 
     url = get_url(text)
@@ -211,6 +232,215 @@ def extract_url(text):
         return url
 
     return None
+
+
+# =========================
+# تنزيل صور TikTok
+# =========================
+
+IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+)
+
+
+def download_tiktok_photos(url, folder):
+
+    logger.info("Starting TikTok photo download")
+
+    command = [
+        sys.executable,
+        "-m",
+        "gallery_dl",
+        "--directory",
+        folder,
+        "--no-input",
+        "--no-mtime",
+        "--quiet",
+        url
+    ]
+
+    try:
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=240
+        )
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "Photo download timed out"
+        )
+
+    if result.returncode != 0:
+
+        error_details = (
+            result.stderr or result.stdout or "Unknown gallery-dl error"
+        )
+
+        logger.error(
+            "GALLERY-DL ERROR: %s",
+            error_details[-2000:]
+        )
+
+        raise RuntimeError(
+            "TikTok photo download failed"
+        )
+
+    photo_files = []
+
+    for root, directories, filenames in os.walk(folder):
+
+        for filename in filenames:
+
+            path = os.path.join(root, filename)
+
+            if (
+                os.path.isfile(path)
+                and filename.lower().endswith(IMAGE_EXTENSIONS)
+                and os.path.getsize(path) > 0
+            ):
+                photo_files.append(path)
+
+    photo_files.sort()
+
+    if not photo_files:
+        raise RuntimeError(
+            "No photos were downloaded"
+        )
+
+    for path in photo_files:
+
+        size = os.path.getsize(path)
+
+        if size > MAX_PHOTO_SIZE:
+            raise RuntimeError(
+                "One of the photos exceeds the upload limit"
+            )
+
+    logger.info(
+        "TikTok photos downloaded: %s",
+        len(photo_files)
+    )
+
+    return photo_files
+
+
+# =========================
+# إرسال الصور إلى تيليجرام
+# =========================
+
+def send_single_photo(chat_id, photo_path):
+
+    with open(photo_path, "rb") as photo_file:
+
+        try:
+
+            telegram_request(
+                "sendPhoto",
+                data={
+                    "chat_id": chat_id
+                },
+                files={
+                    "photo": (
+                        os.path.basename(photo_path),
+                        photo_file
+                    )
+                },
+                timeout=180
+            )
+
+        except Exception:
+
+            photo_file.seek(0)
+
+            telegram_request(
+                "sendDocument",
+                data={
+                    "chat_id": chat_id
+                },
+                files={
+                    "document": (
+                        os.path.basename(photo_path),
+                        photo_file
+                    )
+                },
+                timeout=180
+            )
+
+
+def send_photo_group(chat_id, photo_paths):
+
+    # إذا كانت صورة واحدة
+    if len(photo_paths) == 1:
+
+        send_single_photo(
+            chat_id,
+            photo_paths[0]
+        )
+
+        return
+
+    # تيليجرام يسمح بحد أقصى 10 صور في المجموعة
+    for start in range(0, len(photo_paths), 10):
+
+        batch = photo_paths[start:start + 10]
+
+        # الصور الكبيرة نرسلها بشكل منفصل
+        if any(
+            os.path.getsize(path) > 10 * 1024 * 1024
+            for path in batch
+        ):
+
+            for path in batch:
+                send_single_photo(chat_id, path)
+
+            continue
+
+        media = []
+        files = {}
+        opened_files = []
+
+        try:
+
+            for index, path in enumerate(batch):
+
+                field_name = f"photo{index}"
+
+                photo_file = open(path, "rb")
+                opened_files.append(photo_file)
+
+                files[field_name] = (
+                    os.path.basename(path),
+                    photo_file
+                )
+
+                media.append({
+                    "type": "photo",
+                    "media": f"attach://{field_name}"
+                })
+
+            telegram_request(
+                "sendMediaGroup",
+
+                data={
+                    "chat_id": chat_id,
+                    "media": json.dumps(media)
+                },
+
+                files=files,
+
+                timeout=180
+            )
+
+        finally:
+
+            for photo_file in opened_files:
+                photo_file.close()
 
 
 # =========================
@@ -241,7 +471,6 @@ def download_video(url, folder):
         "overwrites": True,
     }
 
-    # استخدام نوع ImpersonateTarget الصحيح
     options["impersonate"] = ImpersonateTarget.from_str("chrome")
 
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -266,6 +495,7 @@ def download_video(url, folder):
             and not path.endswith(
                 (".part", ".ytdl")
             )
+            and not path.lower().endswith(IMAGE_EXTENSIONS)
         ]
 
         if not video_files:
@@ -378,42 +608,81 @@ def process_download(chat_id, url):
 
     try:
 
-        send_message(
-            chat_id,
-            "⏳ جاري تجهيز الفيديو وتنزيله..."
-        )
-
-        send_action(chat_id)
-
         with tempfile.TemporaryDirectory() as folder:
 
-            logger.info(
-                "Starting download request"
-            )
+            # منشور صور TikTok
+            if is_tiktok_photo_url(url):
 
-            video_path = download_video(
-                url,
-                folder
-            )
+                send_message(
+                    chat_id,
+                    "⏳ جاري تنزيل صور المنشور..."
+                )
 
-            logger.info(
-                "Download completed. File size: %s bytes",
-                os.path.getsize(video_path)
-            )
+                send_action(
+                    chat_id,
+                    "upload_photo"
+                )
 
-            send_message(
-                chat_id,
-                "📤 اكتمل التنزيل، جاري إرسال الفيديو..."
-            )
+                photo_paths = download_tiktok_photos(
+                    url,
+                    folder
+                )
 
-            upload_video(
-                chat_id,
-                video_path
-            )
+                send_message(
+                    chat_id,
+                    f"📸 تم تنزيل {len(photo_paths)} صورة، جاري إرسالها..."
+                )
 
-            logger.info(
-                "Video sent successfully"
-            )
+                send_photo_group(
+                    chat_id,
+                    photo_paths
+                )
+
+                send_message(
+                    chat_id,
+                    "✅ تم إرسال جميع صور المنشور."
+                )
+
+            # منشور فيديو
+            else:
+
+                send_message(
+                    chat_id,
+                    "⏳ جاري تجهيز الفيديو وتنزيله..."
+                )
+
+                send_action(
+                    chat_id,
+                    "upload_video"
+                )
+
+                logger.info(
+                    "Starting video download"
+                )
+
+                video_path = download_video(
+                    url,
+                    folder
+                )
+
+                logger.info(
+                    "Download completed. File size: %s bytes",
+                    os.path.getsize(video_path)
+                )
+
+                send_message(
+                    chat_id,
+                    "📤 اكتمل التنزيل، جاري إرسال الفيديو..."
+                )
+
+                upload_video(
+                    chat_id,
+                    video_path
+                )
+
+                logger.info(
+                    "Video sent successfully"
+                )
 
     except Exception as error:
 
@@ -427,10 +696,11 @@ def process_download(chat_id, url):
         if (
             "max-filesize" in error_text
             or "file size" in error_text
+            or "exceeds the upload limit" in error_text
         ):
 
             message = (
-                "❌ حجم الفيديو أكبر من الحد المسموح (49 MB)."
+                "❌ حجم الملف أكبر من الحد المسموح."
             )
 
         elif (
@@ -439,7 +709,7 @@ def process_download(chat_id, url):
         ):
 
             message = (
-                "❌ الفيديو خاص أو يتطلب تسجيل دخول."
+                "❌ المنشور خاص أو يتطلب تسجيل دخول."
             )
 
         elif "unsupported url" in error_text:
@@ -449,14 +719,14 @@ def process_download(chat_id, url):
         elif "telegram" in error_text:
 
             message = (
-                "❌ تم تنزيل الفيديو لكن تعذر إرساله إلى تيليجرام."
+                "❌ تعذر إرسال المحتوى إلى تيليجرام."
             )
 
         else:
 
             message = (
-                "❌ تعذر تنزيل الفيديو.\n"
-                "تأكد من أن الرابط متاح للعامة وحاول مرة أخرى."
+                "❌ تعذر تنزيل المحتوى.\n"
+                "تأكد من أن المنشور متاح للعامة وحاول مرة أخرى."
             )
 
         send_message(
@@ -510,9 +780,11 @@ def webhook():
     if not chat_id:
         return jsonify({"ok": True})
 
-    command = text.split(maxsplit=1)[0].split("@")[0] if text else ""
+    command = (
+        text.split(maxsplit=1)[0].split("@")[0]
+        if text else ""
+    )
 
-    # أمر البداية
     if command == "/start":
 
         send_message(
@@ -522,7 +794,6 @@ def webhook():
 
         return jsonify({"ok": True})
 
-    # أمر المساعدة
     if command == "/help":
 
         send_message(
@@ -534,7 +805,6 @@ def webhook():
 
     url = get_url(text)
 
-    # منع روابط يوتيوب
     if url and is_youtube_url(url):
 
         send_message(
@@ -554,7 +824,7 @@ def webhook():
         send_message(
             chat_id,
             "❌ الرابط غير مدعوم.\n\n"
-            "أرسل رابط فيديو من:\n"
+            "أرسل رابط فيديو أو منشور صور من:\n"
             "📱 TikTok\n"
             "📸 Instagram\n\n"
             "للمساعدة أرسل /help"

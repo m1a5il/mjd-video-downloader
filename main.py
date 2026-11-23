@@ -10,7 +10,9 @@ import threading
 import subprocess
 import queue
 import sqlite3
+import hmac
 
+from html import escape
 from contextlib import closing
 from urllib.parse import urlparse
 
@@ -28,6 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 APP_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 
 DB_PATH = os.getenv("STATS_DB_PATH", "stats.db")
 
@@ -67,10 +70,6 @@ def get_active_download_count():
 
 
 def ensure_workers_started():
-    """
-    Start workers inside the Gunicorn application process.
-    This function is called before every Flask request.
-    """
 
     global worker_threads
 
@@ -111,6 +110,7 @@ def initialize_workers_for_request():
 # ==================================================
 
 def get_db():
+
     conn = sqlite3.connect(
         DB_PATH,
         timeout=30
@@ -326,6 +326,7 @@ def build_statistics_message():
     )
 
     if not stats["recent"]:
+
         message += "\nلا توجد عمليات مسجلة حتى الآن."
 
     else:
@@ -415,6 +416,7 @@ def telegram_request(method, data=None, files=None, timeout=60):
 
     try:
         result = response.json()
+
     except Exception:
         raise RuntimeError(
             f"Telegram returned HTTP {response.status_code}"
@@ -1133,6 +1135,270 @@ def download_queue_worker():
 
 
 # ==================================================
+# ADMIN DASHBOARD
+# ==================================================
+
+def admin_authorized():
+
+    auth = request.authorization
+
+    return bool(
+        ADMIN_PASSWORD
+        and auth
+        and auth.type.lower() == "basic"
+        and auth.username == "admin"
+        and hmac.compare_digest(
+            auth.password or "",
+            ADMIN_PASSWORD
+        )
+    )
+
+
+@app.route("/admin", methods=["GET"])
+def admin_dashboard():
+
+    if not ADMIN_PASSWORD:
+        return "ADMIN_PASSWORD is not configured in Render.", 503
+
+    if not admin_authorized():
+
+        response = app.response_class(
+            "Authentication required",
+            401,
+            {
+                "WWW-Authenticate":
+                'Basic realm="MJD Admin", charset="UTF-8"'
+            }
+        )
+
+        response.headers["Cache-Control"] = "no-store"
+
+        return response
+
+    stats = get_statistics()
+
+    rows = []
+
+    status_labels = {
+        "queued": "Waiting",
+        "running": "Downloading",
+        "success": "Success",
+        "failed": "Failed"
+    }
+
+    for item in stats["recent"]:
+
+        name = escape(
+            item["customer_name"] or "Unknown user"
+        )
+
+        username = escape(item["username"] or "")
+
+        if username:
+            name += f" (@{username})"
+
+        platform = escape(
+            item["platform"] or "Unknown"
+        )
+
+        status = escape(
+            status_labels.get(
+                item["status"],
+                item["status"] or "Unknown"
+            )
+        )
+
+        created = escape(
+            item["created_at"] or ""
+        )
+
+        rows.append(
+            f"<tr><td>{name}</td>"
+            f"<td>{platform}</td>"
+            f"<td>{status}</td>"
+            f"<td>{created}</td></tr>"
+        )
+
+    recent_html = "".join(rows) or (
+        "<tr><td colspan='4'>No downloads recorded yet.</td></tr>"
+    )
+
+    workers_alive = sum(
+        1 for worker in worker_threads
+        if worker.is_alive()
+    )
+
+    page = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>MJD Admin Dashboard</title>
+<style>
+*{box-sizing:border-box}
+body{
+    margin:0;
+    padding:20px;
+    background:#0b1020;
+    color:#edf2ff;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif
+}
+main{max-width:1100px;margin:auto}
+header{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:12px;
+    flex-wrap:wrap;
+    margin-bottom:22px
+}
+h1{font-size:24px;margin:0}
+h2{font-size:17px;margin:0 0 15px}
+.muted,.sub{color:#9aa7c2}
+.sub{font-size:13px;margin-top:6px}
+.grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(145px,1fr));
+    gap:12px;
+    margin-bottom:15px
+}
+.card,section{
+    background:#151d32;
+    border:1px solid #293650;
+    border-radius:13px;
+    padding:17px
+}
+.card span{
+    display:block;
+    color:#9aa7c2;
+    font-size:13px
+}
+.card strong{
+    display:block;
+    font-size:28px;
+    margin-top:9px
+}
+section{margin-top:15px}
+.metrics{
+    display:flex;
+    gap:22px;
+    flex-wrap:wrap;
+    color:#c8d2e8
+}
+.metrics b{color:#fff}
+.table-wrap{overflow-x:auto}
+table{
+    width:100%;
+    min-width:550px;
+    border-collapse:collapse;
+    text-align:left;
+    font-size:13px
+}
+th,td{
+    padding:12px 8px;
+    border-bottom:1px solid #293650
+}
+th{color:#9aa7c2;font-weight:600}
+footer{
+    margin-top:18px;
+    color:#7886a3;
+    font-size:12px
+}
+@media(max-width:520px){
+    body{padding:14px}
+    .card{padding:14px}
+    .card strong{font-size:24px}
+}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div>
+<h1>MJD Video Downloader</h1>
+<div class="sub">Admin dashboard · Auto refresh every 30 seconds</div>
+</div>
+<div class="muted">Protected admin area</div>
+</header>
+
+<div class="grid">
+<div class="card"><span>Total users</span><strong>__USERS__</strong></div>
+<div class="card"><span>Total downloads</span><strong>__TOTAL__</strong></div>
+<div class="card"><span>Successful</span><strong>__SUCCESS__</strong></div>
+<div class="card"><span>Failed</span><strong>__FAILED__</strong></div>
+<div class="card"><span>Pending</span><strong>__PENDING__</strong></div>
+</div>
+
+<section>
+<h2>Platform statistics</h2>
+<div class="metrics">
+<div>TikTok: <b>__TIKTOK__</b></div>
+<div>Instagram: <b>__INSTAGRAM__</b></div>
+<div>Today's downloads: <b>__TODAY__</b></div>
+</div>
+</section>
+
+<section>
+<h2>Workers and queue</h2>
+<div class="metrics">
+<div>Active workers: <b>__WORKERS__/3</b></div>
+<div>Downloading: <b>__ACTIVE__</b></div>
+<div>Waiting: <b>__WAITING__</b></div>
+</div>
+</section>
+
+<section>
+<h2>Latest 10 downloads</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>User</th>
+<th>Platform</th>
+<th>Status</th>
+<th>Created (UTC)</th>
+</tr>
+</thead>
+<tbody>__RECENT__</tbody>
+</table>
+</div>
+</section>
+
+<footer>MJD Admin · Dates are displayed in UTC.</footer>
+</main>
+</body>
+</html>"""
+
+    values = {
+        "__USERS__": stats["users"],
+        "__TOTAL__": stats["total"],
+        "__SUCCESS__": stats["success"],
+        "__FAILED__": stats["failed"],
+        "__PENDING__": stats["pending"],
+        "__TIKTOK__": stats["tiktok"],
+        "__INSTAGRAM__": stats["instagram"],
+        "__TODAY__": stats["today_total"],
+        "__WORKERS__": workers_alive,
+        "__ACTIVE__": get_active_download_count(),
+        "__WAITING__": download_queue.qsize(),
+        "__RECENT__": recent_html
+    }
+
+    for key, value in values.items():
+        page = page.replace(key, str(value))
+
+    response = app.response_class(
+        page,
+        mimetype="text/html"
+    )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return response
+
+
+# ==================================================
 # WEB ROUTES
 # ==================================================
 
@@ -1299,8 +1565,6 @@ def webhook():
 
     platform = get_platform(url)
 
-    # Queue insertion is protected so simultaneous
-    # webhook requests cannot exceed the queue limit.
     with workers_lock:
 
         waiting_count = download_queue.qsize()
@@ -1345,7 +1609,6 @@ def webhook():
         waiting_after_insert = download_queue.qsize()
 
     if running_count < MAX_CONCURRENT_DOWNLOADS:
-        position = 1
 
         confirmation = (
             "✅ تم استلام طلبك.\n"
@@ -1354,11 +1617,9 @@ def webhook():
 
     else:
 
-        position = waiting_after_insert
-
         confirmation = (
             "✅ تم استلام طلبك وإضافته إلى طابور التحميل.\n"
-            f"📍 ترتيبك التقريبي في الانتظار: {position}\n"
+            f"📍 ترتيبك التقريبي في الانتظار: {waiting_after_insert}\n"
             "سيبدأ التنزيل عند توفر مسار."
         )
 
